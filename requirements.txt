@@ -3,7 +3,7 @@ streamlit>=1.58,<2
 
 # AI inference and image processing
 ultralytics>=8.4,<9
-opencv-python>=4.8,<5
+opencv-python-headless>=4.8,<5
 Pillow>=12,<13
 numpy>=1.26,<3
 

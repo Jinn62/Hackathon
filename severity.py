@@ -151,6 +151,64 @@ def assess_image(model, image_path, turbine_id="터빈-01", conf=0.25):
     return assessment
 
 
+def assess_video(
+    model, video_path, turbine_id="터빈-01", conf=0.25,
+    sample_interval_sec=1.0, max_frames=30,
+):
+    """
+    동영상 경로 → 일정 간격으로 프레임을 샘플링해 각각 탐지하고,
+    위험도가 가장 높은 프레임을 대표 결과로 반환한다.
+    (정지 이미지 1장을 다루는 assess_image와 동일한 반환 형식 + 프레임 메타데이터)
+
+    반환값의 "frame_results"에는 샘플링한 모든 프레임의 (초, YOLO 결과)가
+    시간순으로 담기며, 탐지 결과를 타임랩스 영상으로 만들 때 사용한다.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"동영상을 열 수 없습니다: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_interval = max(int(round(fps * sample_interval_sec)), 1)
+
+    best = None  # (score, result, assessment, frame_index)
+    frame_results = []  # [{"timestamp_sec": ..., "yolo_result": ...}, ...] 시간순
+    frame_index = 0
+    sampled = 0
+    try:
+        while sampled < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_index % frame_interval == 0:
+                result = model.predict(frame, conf=conf, verbose=False)[0]
+                dets = detections_from_yolo(result)
+                assessment = assess(dets, turbine_id)
+                frame_results.append({
+                    "timestamp_sec": round(frame_index / fps, 1),
+                    "yolo_result": result,
+                })
+                if best is None or assessment["score"] > best[2]["score"]:
+                    best = (result, frame_index, assessment)
+                sampled += 1
+            frame_index += 1
+    finally:
+        cap.release()
+
+    if best is None:
+        raise ValueError("동영상에서 프레임을 읽을 수 없습니다.")
+
+    result, frame_index, assessment = best
+    assessment["yolo_result"] = result
+    assessment["source"] = "video"
+    assessment["frame_index"] = frame_index
+    assessment["timestamp_sec"] = round(frame_index / fps, 1)
+    assessment["sampled_frames"] = sampled
+    assessment["frame_results"] = frame_results
+    return assessment
+
+
 if __name__ == "__main__":
     # 모듈 단독 테스트 (YOLO 없이 로직만)
     cases = {

@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
-_tmp_upload.jpg
+_tmp_upload*
+_tmp_detection_timelapse.mp4
+history_store.json*
 .venv/
 venv/

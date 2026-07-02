@@ -7,10 +7,14 @@ app.py — 나의 터빈일지 | 풍력 터빈 손상 탐지 관리자 알람 �
 
 준비물: best.pt (학습된 모델), severity.py (같은 폴더)
 """
+import base64
+import shutil
+import subprocess
 import time
 from io import BytesIO
 from datetime import datetime
 
+import numpy as np
 import requests
 import streamlit as st
 import pandas as pd
@@ -18,8 +22,9 @@ from PIL import Image
 from ultralytics import YOLO
 
 from config import MODEL_PATH
+from history_store import add_history_entry, find_entry, load_history
 from severity import (
-    assess_image,
+    assess_image, assess_video,
     CLASSES, GRADE_COLOR, GRADE_BG, GRADE_BORDER,
     GRADE_ACTION, GRADE_GUIDE, CLASS_ICON, CLASS_WEIGHT,
     size_label, score_one,
@@ -28,6 +33,41 @@ from severity import (
 # ===== 설정 =====
 DISPLAY_CONF_MIN = 0.7          # 화면에 표시할 최소 신뢰도 (판정 로직과는 무관, 표시 전용)
 NTFY_TOPIC = "turbine-alarm-1234"
+IMAGE_TYPES = ["jpg", "jpeg", "png"]
+VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
+VIDEO_SAMPLE_INTERVAL_SEC = 1.0  # 동영상에서 프레임을 샘플링할 간격
+VIDEO_MAX_FRAMES = 30            # 동영상당 최대 분석 프레임 수 (데모 환경 처리 시간 보호)
+VIDEO_OUTPUT_FPS = 2             # 탐지 결과 타임랩스 영상 재생 속도 (샘플링 간격과 무관하게 고정)
+
+
+def encode_frames_to_video(frames_bgr, fps, output_path):
+    """BGR numpy 프레임들을 ffmpeg(H.264)로 인코딩해 브라우저 재생 가능한 mp4로 저장한다.
+
+    opencv-python-headless는 라이선스 문제로 H.264 인코딩을 지원하지 않아
+    (기본 mp4v 코덱은 Chrome/Firefox에서 재생되지 않음) 시스템 ffmpeg를 직접 사용한다.
+    """
+    if not frames_bgr:
+        raise ValueError("인코딩할 프레임이 없습니다.")
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "ffmpeg를 찾을 수 없습니다. 로컬은 ffmpeg를 설치하고, "
+            "Streamlit Cloud는 packages.txt에 ffmpeg를 추가하세요."
+        )
+
+    height, width = frames_bgr[0].shape[:2]
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    raw = b"".join(np.ascontiguousarray(f).tobytes() for f in frames_bgr)
+    proc = subprocess.run(cmd, input=raw, capture_output=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg 인코딩 실패: {proc.stderr.decode(errors='ignore')[-500:]}")
 
 st.set_page_config(page_title="나의 터빈일지", page_icon="🌀", layout="wide")
 
@@ -395,6 +435,14 @@ st.markdown(
         height: 100% !important; margin: 0 auto; object-fit: cover; object-position: center;
         border-radius: 14px;
     }
+    .st-key-detection_image_wrap [data-testid="stVideo"] {
+        width: 100%; margin: 0 auto; border-radius: 16px; overflow: hidden;
+        background: #0F172A;
+    }
+    .st-key-detection_image_wrap [data-testid="stVideo"] video {
+        width: 100%; max-height: 520px; display: block; margin: 0 auto;
+        object-fit: contain; border-radius: 16px;
+    }
     .st-key-detection_image_wrap [data-testid="stCaptionContainer"],
     .st-key-detection_image_wrap .stCaption {
         width: 100%; max-width: none; margin: 12px auto 0; color: #64748B !important;
@@ -684,9 +732,16 @@ def make_inspection_pdf(result, plotted_image, inspected_at):
     return pdf_buffer.getvalue()
 
 
-# 세션에 점검 이력 저장 (터빈일지)
-if "history" not in st.session_state:
-    st.session_state.history = []
+def image_to_base64_jpeg(image_rgb, quality=85):
+    """RGB numpy 배열 → base64 JPEG 문자열 (공유 이력에 대표 이미지로 저장)."""
+    buffer = BytesIO()
+    Image.fromarray(image_rgb).save(buffer, format="JPEG", quality=quality)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def base64_jpeg_to_image(b64_str):
+    """base64 JPEG 문자열 → RGB numpy 배열 (공유 이력에서 불러올 때 복원)."""
+    return np.array(Image.open(BytesIO(base64.b64decode(b64_str))).convert("RGB"))
 
 
 # ===== 헤더 =====
@@ -705,75 +760,44 @@ with st.container(border=True):
     st.markdown(
         "<div class='input-card-anchor'></div>"
         "<div class='input-card-title'>점검 입력</div>"
-        "<div class='input-card-sub'>점검 이미지와 관리 대상 터빈을 입력하세요.</div>",
+        "<div class='input-card-sub'>점검 이미지·영상과 관리 대상 터빈을 입력하세요.</div>",
         unsafe_allow_html=True,
     )
     col_in, col_id = st.columns([7, 3], gap="medium")
     with col_in:
-        uploaded = st.file_uploader("터빈 이미지 업로드", type=["jpg", "jpeg", "png"])
+        uploaded = st.file_uploader(
+            "터빈 이미지/영상 업로드", type=IMAGE_TYPES + VIDEO_TYPES,
+            help="영상은 1초 간격으로 최대 30프레임을 샘플링해 가장 위험도가 높은 "
+                 "프레임을 대표 결과로 분석합니다.",
+        )
     with col_id:
         turbine_id = st.text_input("터빈 ID", value="터빈-03")
 
-if uploaded:
-    # ===== 순차 진행 상태 표시 =====
-    with st.status("분석 진행 중...", expanded=True) as status:
-        st.write("🖼️ 이미지 로드 중...")
-        img = Image.open(uploaded).convert("RGB")
-        tmp_path = "_tmp_upload.jpg"
-        img.save(tmp_path)
-        time.sleep(0.3)
+def render_analysis(result, turbine_id, plotted, inspected_at, previous, is_demo_previous, is_history_view=False):
+    """분석 결과 하나를 대시보드로 렌더링한다.
 
-        st.write("🔎 YOLO 탐지 진행 중...")
-        result = assess_image(model, tmp_path, turbine_id=turbine_id)
-        yolo_res = result["yolo_result"]
-        time.sleep(0.3)
-
-        st.write("📐 심각도 계산 중...")
-        time.sleep(0.3)
-
-        grade = result["grade"]
-        color = GRADE_COLOR[grade]
-        st.write(f"{result['emoji']} 등급 판정 완료 — {grade}")
-        time.sleep(0.3)
-
-        st.write("📢 에스컬레이션 정책 확인 중...")
-        time.sleep(0.3)
-
-        status.update(label="분석 완료", state="complete", expanded=False)
-
-    st.write("")
-
-    # 위험 등급은 담당자 알림 버튼을 누르지 않아도 ntfy 푸시를 자동 발송한다.
-    # 같은 업로드+터빈ID 조합에서는 재실행(다른 버튼 클릭 등)마다 중복 발송되지
-    # 않도록 file_id로 한 번만 보낸다.
-    auto_alert_key = f"{turbine_id}:{uploaded.file_id}"
-    if grade == "위험" and st.session_state.get("last_auto_alert_key") != auto_alert_key:
-        try:
-            send_ntfy_alert(result)
-            st.session_state.ntfy_status = ("success", None, True)
-        except Exception as e:
-            st.session_state.ntfy_status = ("error", str(e), True)
-        st.session_state.last_auto_alert_key = auto_alert_key
-
-    inspected_at = datetime.now()
-    previous = next(
-        (item for item in st.session_state.history if item["터빈"] == turbine_id),
-        {"위험도": 24.0, "Damage": 1, "Dirt": 2, "등급": "🟠 주의"},
-    )
-    is_demo_previous = not any(
-        item["터빈"] == turbine_id for item in st.session_state.history
-    )
-
-    # 화면 및 PDF에 동일한 고신뢰도 탐지 이미지를 사용
-    display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
-    # 표시 전용 라벨 크기와 선 두께를 고정해 박스 가장자리의 가독성을 확보한다.
-    plotted = display_res.plot(line_width=2, font_size=13)[:, :, ::-1]
+    실시간 업로드 직후와, 공유 이력에서 과거 기록을 불러와 다시 볼 때
+    양쪽에서 재사용한다 (관리자 A가 분석한 화면을 B/C가 그대로 다시 볼 수
+    있어야 하므로, 렌더링 로직 자체를 입력값에서 완전히 분리했다).
+    """
+    grade = result["grade"]
+    color = GRADE_COLOR[grade]
     grade_bg, grade_border = GRADE_BG[grade], GRADE_BORDER[grade]
     css_vars = f"--grade-color:{color};--grade-bg:{grade_bg};--grade-border:{grade_border};"
     grade_class = {
         "정상": "grade-normal", "관찰": "grade-watch",
         "주의": "grade-caution", "위험": "grade-danger",
     }[grade]
+
+    if is_history_view:
+        st.markdown(
+            f"""<div class="notification-card fade-in" style="border-left:4px solid #2563EB;">
+                    🔍 <b>불러온 점검 기록</b> — {turbine_id} · {inspected_at.strftime('%Y-%m-%d %H:%M')}
+                    (다른 관리자가 분석한 결과일 수 있습니다)
+                </div>""",
+            unsafe_allow_html=True,
+        )
+        st.write("")
 
     # ===== 관리자 Overview =====
     st.markdown(
@@ -810,8 +834,30 @@ if uploaded:
                 unsafe_allow_html=True,
             )
             with st.container(key="detection_image_wrap"):
-                st.image(plotted, width="stretch")
-                st.caption(f"※ 화면에는 신뢰도 {int(DISPLAY_CONF_MIN*100)}% 이상 탐지만 표시됩니다.")
+                caption = f"※ 화면에는 신뢰도 {int(DISPLAY_CONF_MIN*100)}% 이상 탐지만 표시됩니다."
+                if result.get("source") == "video":
+                    if result.get("output_video_path") and not is_history_view:
+                        st.video(result["output_video_path"])
+                        caption += (
+                            f" (샘플링 {result['sampled_frames']}프레임 타임랩스 · "
+                            f"위험도 최고 지점: {result['timestamp_sec']}초)"
+                        )
+                    elif is_history_view:
+                        st.image(plotted, width="stretch")
+                        caption += (
+                            f" (영상 {result['timestamp_sec']}초 지점 · 위험도 최고 프레임 — "
+                            "공유 이력에는 대표 프레임만 저장됩니다)"
+                        )
+                    else:
+                        st.image(plotted, width="stretch")
+                        caption += (
+                            f" (영상 {result['timestamp_sec']}초 지점 · "
+                            f"샘플링 {result['sampled_frames']}프레임 중 위험도 최고 프레임 — "
+                            "타임랩스 영상 생성 실패로 대표 프레임만 표시)"
+                        )
+                else:
+                    st.image(plotted, width="stretch")
+                st.caption(caption)
 
     with col_res:
         briefing_points, briefing_actions = ai_briefing(result, previous)
@@ -975,23 +1021,161 @@ if uploaded:
             })
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, row_height=32)
 
-    # ===== 점검 이력 기록 =====
-    st.session_state.history.insert(0, {
-        "시각": datetime.now().strftime("%H:%M:%S"),
+
+if uploaded:
+    file_ext = uploaded.name.rsplit(".", 1)[-1].lower()
+    is_video = file_ext in VIDEO_TYPES
+    st.session_state.pop("selected_history_id", None)  # 새 업로드가 불러오기 화면보다 우선한다
+
+    # ===== 순차 진행 상태 표시 =====
+    with st.status("분석 진행 중...", expanded=True) as status:
+        if is_video:
+            st.write("🎞️ 영상 로드 중...")
+            tmp_path = f"_tmp_upload.{file_ext}"
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            time.sleep(0.3)
+
+            st.write(f"🔎 프레임 샘플링(최대 {VIDEO_MAX_FRAMES}개) 및 YOLO 탐지 진행 중...")
+            result = assess_video(
+                model, tmp_path, turbine_id=turbine_id,
+                sample_interval_sec=VIDEO_SAMPLE_INTERVAL_SEC, max_frames=VIDEO_MAX_FRAMES,
+            )
+            yolo_res = result["yolo_result"]
+            st.write(
+                f"🖼️ 대표 프레임 선정 완료 — {result['timestamp_sec']}초 지점 "
+                f"(총 {result['sampled_frames']}프레임 중 위험도 최고)"
+            )
+            time.sleep(0.3)
+
+            st.write("🎬 탐지 결과 타임랩스 영상 생성 중...")
+            frame_plots_bgr = [
+                fr["yolo_result"][fr["yolo_result"].boxes.conf >= DISPLAY_CONF_MIN]
+                .plot(line_width=2, font_size=13)
+                for fr in result["frame_results"]
+            ]
+            output_video_path = "_tmp_detection_timelapse.mp4"
+            try:
+                encode_frames_to_video(frame_plots_bgr, VIDEO_OUTPUT_FPS, output_video_path)
+                result["output_video_path"] = output_video_path
+            except Exception as e:
+                result["video_encode_error"] = str(e)
+            time.sleep(0.3)
+        else:
+            st.write("🖼️ 이미지 로드 중...")
+            img = Image.open(uploaded).convert("RGB")
+            tmp_path = "_tmp_upload.jpg"
+            img.save(tmp_path)
+            time.sleep(0.3)
+
+            st.write("🔎 YOLO 탐지 진행 중...")
+            result = assess_image(model, tmp_path, turbine_id=turbine_id)
+            yolo_res = result["yolo_result"]
+            time.sleep(0.3)
+
+        st.write("📐 심각도 계산 중...")
+        time.sleep(0.3)
+
+        grade = result["grade"]
+        st.write(f"{result['emoji']} 등급 판정 완료 — {grade}")
+        time.sleep(0.3)
+
+        st.write("📢 에스컬레이션 정책 확인 중...")
+        time.sleep(0.3)
+
+        status.update(label="분석 완료", state="complete", expanded=False)
+
+    st.write("")
+
+    # 위험 등급은 담당자 알림 버튼을 누르지 않아도 ntfy 푸시를 자동 발송한다.
+    # 같은 업로드+터빈ID 조합에서는 재실행(다른 버튼 클릭 등)마다 중복 발송되지
+    # 않도록 file_id로 한 번만 보낸다.
+    auto_alert_key = f"{turbine_id}:{uploaded.file_id}"
+    if grade == "위험" and st.session_state.get("last_auto_alert_key") != auto_alert_key:
+        try:
+            send_ntfy_alert(result)
+            st.session_state.ntfy_status = ("success", None, True)
+        except Exception as e:
+            st.session_state.ntfy_status = ("error", str(e), True)
+        st.session_state.last_auto_alert_key = auto_alert_key
+
+    inspected_at = datetime.now()
+    shared_history = load_history()
+    previous = next(
+        (item for item in shared_history if item["터빈"] == turbine_id),
+        {"위험도": 24.0, "Damage": 1, "Dirt": 2, "등급": "🟠 주의"},
+    )
+    is_demo_previous = not any(item["터빈"] == turbine_id for item in shared_history)
+
+    # 화면 및 PDF에 동일한 고신뢰도 탐지 이미지를 사용
+    display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
+    # 표시 전용 라벨 크기와 선 두께를 고정해 박스 가장자리의 가독성을 확보한다.
+    plotted = display_res.plot(line_width=2, font_size=13)[:, :, ::-1]
+
+    render_analysis(result, turbine_id, plotted, inspected_at, previous, is_demo_previous)
+
+    # ===== 공유 점검 이력에 기록 (모든 관리자가 함께 봄) =====
+    add_history_entry({
+        "시각": inspected_at.strftime("%H:%M:%S"),
+        "날짜": inspected_at.strftime("%Y-%m-%d"),
         "터빈": turbine_id,
         "등급": f"{result['emoji']} {grade}",
         "위험도": result["score"],
         "Damage": result["n_damage"],
         "Dirt": result["n_dirt"],
+        "grade": result["grade"], "emoji": result["emoji"], "score": result["score"],
+        "n_damage": result["n_damage"], "n_dirt": result["n_dirt"], "recheck": result["recheck"],
+        "channels": result["channels"], "targets": result["targets"],
+        "counted": result["counted"], "recheck_list": result["recheck_list"],
+        "source": result.get("source", "image"),
+        "timestamp_sec": result.get("timestamp_sec"),
+        "sampled_frames": result.get("sampled_frames"),
+        "inspected_at": inspected_at.isoformat(),
+        "previous_snapshot": previous,
+        "is_demo_previous": is_demo_previous,
+        "plotted_image_b64": image_to_base64_jpeg(plotted),
     })
 
-# ===== 점검 이력 (터빈일지) =====
+elif st.session_state.get("selected_history_id"):
+    shared_history = load_history()
+    entry = find_entry(shared_history, st.session_state["selected_history_id"])
+    if entry is None:
+        st.info("선택한 점검 기록을 더 이상 찾을 수 없습니다 (오래되어 정리되었을 수 있습니다).")
+    else:
+        result = {
+            "turbine_id": entry["터빈"], "grade": entry["grade"], "emoji": entry["emoji"],
+            "score": entry["score"], "n_damage": entry["n_damage"], "n_dirt": entry["n_dirt"],
+            "recheck": entry["recheck"], "channels": entry["channels"], "targets": entry["targets"],
+            "counted": entry["counted"], "recheck_list": entry["recheck_list"],
+            "source": entry.get("source", "image"),
+            "timestamp_sec": entry.get("timestamp_sec"),
+            "sampled_frames": entry.get("sampled_frames"),
+        }
+        plotted = base64_jpeg_to_image(entry["plotted_image_b64"])
+        inspected_at = datetime.fromisoformat(entry["inspected_at"])
+        if st.button("✕ 불러오기 닫기"):
+            st.session_state.pop("selected_history_id", None)
+            st.rerun()
+        render_analysis(
+            result, entry["터빈"], plotted, inspected_at,
+            entry["previous_snapshot"], entry.get("is_demo_previous", False),
+            is_history_view=True,
+        )
+
+# ===== 점검 이력 (터빈일지 · 전체 관리자 공유) =====
 st.divider()
-st.markdown("<div class='section-title'>📒 점검 이력 (터빈일지)</div>", unsafe_allow_html=True)
-if st.session_state.history:
-    df = pd.DataFrame(st.session_state.history)
+st.markdown("<div class='section-title'>📒 점검 이력 (터빈일지 · 전체 관리자 공유)</div>", unsafe_allow_html=True)
+shared_history = load_history()
+if shared_history:
+    st.caption(
+        "이 목록은 서버에 저장되어 모든 관리자가 함께 봅니다. 행을 선택하고 "
+        "아래 버튼을 누르면 그 점검 당시 화면을 그대로 불러와 볼 수 있습니다. "
+        "(업로드된 파일이 있으면 불러오기보다 우선 표시되니, 업로드 목록에서 파일을 제거하세요.)"
+    )
+    df = pd.DataFrame(shared_history)
     if st.checkbox("위험도 높은 순으로 정렬"):
         df = df.sort_values("위험도", ascending=False)
+    display_cols = [c for c in ["시각", "날짜", "터빈", "등급", "위험도", "Damage", "Dirt"] if c in df.columns]
 
     def _tint_row(row):
         for g, bg in GRADE_BG.items():
@@ -999,10 +1183,18 @@ if st.session_state.history:
                 return [f"background-color:{bg}"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(
-        df.style.apply(_tint_row, axis=1),
+    event = st.dataframe(
+        df[display_cols].style.apply(_tint_row, axis=1),
         width="stretch", hide_index=True, row_height=32,
         column_config={"위험도": st.column_config.NumberColumn("위험도", format="%.1f")},
+        on_select="rerun", selection_mode="single-row", key="history_table",
     )
+
+    selected_rows = event.selection.rows if event and event.selection else []
+    if selected_rows and not uploaded:
+        selected_entry = df.iloc[selected_rows[0]]
+        if st.button(f"🔍 선택한 점검 불러오기 ({selected_entry['터빈']} · {selected_entry['시각']})"):
+            st.session_state["selected_history_id"] = selected_entry["id"]
+            st.rerun()
 else:
-    st.caption("아직 점검 이력이 없습니다. 이미지를 업로드하세요.")
+    st.caption("아직 점검 이력이 없습니다. 이미지나 영상을 업로드하세요.")
