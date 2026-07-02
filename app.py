@@ -2,15 +2,19 @@
 app.py — 나의 터빈일지 | 풍력 터빈 손상 탐지 관리자 알람 대시보드
 
 실행:
-    pip install streamlit ultralytics
+    pip install -r requirements.txt
     streamlit run app.py
 
-준비물: best.pt (학습된 모델), severity.py (같은 폴더)
+준비물:
+    - best.pt (학습된 YOLO 모델, 같은 폴더)
+    - severity.py, history_store.py, config.py (같은 폴더)
+    - 동영상 탐지 결과 재생에는 시스템 ffmpeg 필요 (자세한 내용은 README 참고)
 """
 import base64
 import shutil
 import subprocess
 import time
+import uuid
 from io import BytesIO
 from datetime import datetime
 
@@ -22,7 +26,7 @@ from PIL import Image
 from ultralytics import YOLO
 
 from config import MODEL_PATH
-from history_store import add_history_entry, find_entry, load_history
+from history_store import add_history_entry, delete_entries, find_entry, load_history
 from severity import (
     assess_image, assess_video,
     CLASSES, GRADE_COLOR, GRADE_BG, GRADE_BORDER,
@@ -37,6 +41,7 @@ IMAGE_TYPES = ["jpg", "jpeg", "png"]
 VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
 VIDEO_SAMPLE_INTERVAL_SEC = 1.0  # 동영상에서 프레임을 샘플링할 간격
 VIDEO_MAX_FRAMES = 30            # 동영상당 최대 분석 프레임 수 (데모 환경 처리 시간 보호)
+TURBINE_IDS = [f"터빈-{i:02d}" for i in range(1, 11)]  # 터빈-01 ~ 터빈-10
 VIDEO_OUTPUT_FPS = 2             # 탐지 결과 타임랩스 영상 재생 속도 (샘플링 간격과 무관하게 고정)
 
 
@@ -129,7 +134,6 @@ st.markdown(
     .section-title {
         color: #111827; font-size: 17px; font-weight: 800; margin: 0 0 10px 0;
     }
-    .section-sub { color: #64748B; font-size: 12.5px; margin-top: -6px; margin-bottom: 10px; }
     .input-card-title { color: #111827; font-size: 17px; font-weight: 800; margin-bottom: 2px; }
     .input-card-sub { color: #64748B; font-size: 12.5px; margin-bottom: 8px; }
 
@@ -140,7 +144,7 @@ st.markdown(
     }
 
     /* ---------- 공통 카드 스타일 ---------- */
-    .kpi-card, .severity-card, .esc-card, .img-card, .overview-card,
+    .kpi-card, .severity-card, .overview-card,
     .ai-card, .compare-card, .notification-card {
         background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 16px;
         box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06); padding: 20px;
@@ -159,10 +163,7 @@ st.markdown(
     .ai-title, .compare-title, .notification-title {
         color: #0F172A; font-size: 16px; font-weight: 700; margin-bottom: 8px;
     }
-    .ai-copy { color: #334155; font-size: 14px; line-height: 1.7; }
     .notification-card { margin: 16px 0; padding: 14px 16px; background: #F8FAFC; border-color: #E2E8F0; }
-    .notification-result { color: var(--grade-color); font-size: 13px; font-weight: 800; }
-    .notification-meta { color: #64748B; font-size: 11px; margin-top: 4px; }
     .compare-card { width: 100%; max-width: none; margin: 12px 0 16px; padding: 24px; }
     .compare-table { display: grid; grid-template-columns: 1fr 1fr 1fr; width: 100%; border: 1px solid #E2E8F0; border-radius: 12px; overflow: hidden; }
     .compare-cell { padding: 10px 14px; border-right: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0; color: #334155; font-size: 13px; }
@@ -192,7 +193,6 @@ st.markdown(
     .alert-off { color: #94A3B8; font-size: 13px; }
     .report-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid #E2E8F0; }
     .report-section-title { color: #0F172A; font-size: 14px; font-weight: 800; }
-    .report-section-sub { color: #64748B; font-size: 11px; margin-top: 2px; }
     .st-key-side_panel {
         background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 16px;
         box-shadow: 0 4px 16px rgba(15,23,42,.06); padding: 20px;
@@ -318,22 +318,6 @@ st.markdown(
     .report-card .report-row span:first-child { color: #94A3B8; }
     .report-card .report-row span:last-child { font-weight: 700; color: #F1F5F9; }
 
-    /* 에스컬레이션 카드 */
-    .esc-header { font-size: 14px; font-weight: 800; color: #0F172A; margin-bottom: 10px; }
-    .esc-row { margin-bottom: 8px; }
-    .esc-row-label { font-size: 11px; color: #64748B; font-weight: 700; text-transform: uppercase;
-                      margin-right: 6px; }
-    .chip {
-        display: inline-flex; align-items: center; gap: 5px; background: #F1F5F9;
-        border: 1px solid #E2E8F0; border-radius: 999px; padding: 3px 11px; margin: 3px 5px 0 0;
-        font-size: 12.5px; font-weight: 600; color: #334155;
-    }
-    .esc-note {
-        margin-top: 6px; font-size: 12.5px; font-weight: 600; border-radius: 8px;
-        padding: 8px 12px; background: var(--grade-bg); color: var(--grade-color);
-        border: 1px solid var(--grade-border);
-    }
-
     /* 등급 범례 */
     .legend-row { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; color: #111827; }
     .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -350,20 +334,20 @@ st.markdown(
         background: #FFFFFF; border-radius: 16px;
     }
     /* 입력 컬럼: 68/28 비율, 동일한 기준선과 24px 간격 */
-    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stTextInput"]) {
+    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stSelectbox"]) {
         display: flex; align-items: flex-end; gap: 24px;
     }
-    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stTextInput"]) > div:first-child {
+    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stSelectbox"]) > div:first-child {
         flex: 0 1 68%; width: 68%;
     }
-    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stTextInput"]) > div:last-child {
+    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stSelectbox"]) > div:last-child {
         flex: 0 1 28%; width: 28%;
     }
-    [data-testid="stFileUploader"], [data-testid="stTextInput"] {
+    [data-testid="stFileUploader"], [data-testid="stSelectbox"] {
         width: 100%;
     }
     [data-testid="stFileUploader"] [data-testid="stWidgetLabel"],
-    [data-testid="stTextInput"] [data-testid="stWidgetLabel"] {
+    [data-testid="stSelectbox"] [data-testid="stWidgetLabel"] {
         min-height: 24px; margin-bottom: 6px; display: flex; align-items: center;
     }
     [data-testid="stFileUploaderDropzone"] {
@@ -381,15 +365,10 @@ st.markdown(
     [data-testid="stFileUploaderDropzoneInstructions"] span,
     [data-testid="stFileUploaderDropzoneInstructions"] small { font-size: 12px; }
     [data-testid="stFileUploader"] section { padding: 0; margin: 0; }
-    [data-testid="stTextInput"] input {
-        box-sizing: border-box; height: 56px; min-height: 56px; padding: 0 16px;
-        line-height: 56px; font-size: 15px; background: #F8FAFC; color: #0F172A;
-        border-color: #CBD5E1; border-radius: 12px !important;
-    }
-    [data-testid="stTextInput"] > div,
-    [data-testid="stTextInput"] [data-baseweb="input"] {
-        min-height: 56px; height: 56px; display: flex; align-items: center;
-        border-radius: 12px;
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+        box-sizing: border-box; min-height: 56px; height: 56px; padding: 0 16px;
+        display: flex; align-items: center; font-size: 15px; background: #F8FAFC;
+        color: #0F172A; border-color: #CBD5E1; border-radius: 12px !important;
     }
     [data-testid="stFileUploaderDropzone"] { margin-top: 0; }
     [data-testid="stWidgetLabel"] p { color: #334155; font-weight: 600; font-size: 13px; }
@@ -488,45 +467,6 @@ def load_model():
     return model
 
 
-def channel_badges(channels):
-    """알림 채널 문자열 → (아이콘, 라벨) 배지 목록 (표시 전용)"""
-    badges = []
-    for ch in channels:
-        low = ch.lower()
-        if "로그" in ch:
-            badges.append(("📝", "로그 기록"))
-        if "대시보드" in ch:
-            badges.append(("📊", "Dashboard"))
-        if "이메일" in ch:
-            badges.append(("📧", "Email"))
-        if "팀" in ch and "메시지" in ch:
-            badges.append(("💬", "팀 메시지"))
-        if "slack" in low:
-            badges.append(("🚨", "Slack") if "즉시" in ch else ("💬", "Slack"))
-        if "sms" in low:
-            badges.append(("📱", "SMS"))
-    return badges
-
-
-def target_badges(targets):
-    """알림 대상 문자열 → (아이콘, 라벨) 배지 목록 (표시 전용)"""
-    badges = []
-    for t in targets:
-        if "현장" in t:
-            badges.append(("👷", "현장 담당자"))
-        elif t == "팀":
-            badges.append(("👥", "팀"))
-        elif "관리자" in t or "책임자" in t:
-            badges.append(("👨‍💼", "관리자/책임자"))
-        else:
-            badges.append(("👤", t))
-    return badges
-
-
-def render_chips(badges):
-    return "".join(f"<span class='chip'>{icon} {label}</span>" for icon, label in badges)
-
-
 def kpi_card(icon, label, value):
     st.markdown(
         f"""<div class="kpi-card fade-in">
@@ -536,16 +476,6 @@ def kpi_card(icon, label, value):
             </div>""",
         unsafe_allow_html=True,
     )
-
-
-def notification_result(grade):
-    """등급별 알림 시뮬레이션 문구."""
-    return {
-        "정상": "🟢 점검 로그 저장 완료",
-        "관찰": "🟡 관리자 대시보드 등록 완료",
-        "주의": "🟠 현장 담당자 이메일 발송 완료",
-        "위험": "🔴 Slack 긴급알림 발송 완료",
-    }[grade]
 
 
 def make_ntfy_message(assessment):
@@ -771,7 +701,36 @@ with st.container(border=True):
                  "프레임을 대표 결과로 분석합니다.",
         )
     with col_id:
-        turbine_id = st.text_input("터빈 ID", value="터빈-03")
+        turbine_id = st.selectbox("터빈 ID", TURBINE_IDS, index=2)
+
+
+@st.dialog("테스트 기록 삭제")
+def confirm_delete_history_entry(entry):
+    """공유 이력 삭제는 모든 관리자 화면에 영향을 주므로 확인 팝업을 거친다.
+
+    이 버튼은 데모/테스트 편의용 하드 삭제다. 실서비스에서는 감사(audit)
+    추적이 필요하므로 삭제 대신 아카이브/무효 처리가 적합하다 (README 참고).
+    """
+    st.write(
+        f"**{entry['터빈']}** · {entry.get('날짜', '')} {entry['시각']} · {entry['등급']} "
+        f"(위험도 {entry['위험도']:.1f}) 테스트 기록을 삭제할까요?"
+    )
+    st.caption(
+        "이 목록은 모든 관리자가 함께 봅니다 — 삭제하면 다른 관리자 화면에서도 사라지고 되돌릴 수 없습니다. "
+        "데모 중 만든 테스트 기록을 정리하는 용도입니다."
+    )
+    col_confirm, col_cancel = st.columns(2)
+    with col_confirm:
+        if st.button("🗑️ 테스트 기록 삭제", width="stretch", type="primary"):
+            delete_entries([entry["id"]])
+            if st.session_state.get("selected_history_id") == entry["id"]:
+                st.session_state.pop("selected_history_id", None)
+            st.toast("테스트 기록을 삭제했습니다.")
+            st.rerun()
+    with col_cancel:
+        if st.button("취소", width="stretch"):
+            st.rerun()
+
 
 def render_analysis(result, turbine_id, plotted, inspected_at, previous, is_demo_previous, is_history_view=False):
     """분석 결과 하나를 대시보드로 렌더링한다.
@@ -1027,114 +986,131 @@ if uploaded:
     is_video = file_ext in VIDEO_TYPES
     st.session_state.pop("selected_history_id", None)  # 새 업로드가 불러오기 화면보다 우선한다
 
-    # ===== 순차 진행 상태 표시 =====
-    with st.status("분석 진행 중...", expanded=True) as status:
-        if is_video:
-            st.write("🎞️ 영상 로드 중...")
-            tmp_path = f"_tmp_upload.{file_ext}"
-            with open(tmp_path, "wb") as f:
-                f.write(uploaded.getbuffer())
+    # 이 파일(+터빈ID)을 이미 분석했으면 재실행하지 않는다. history 표에서
+    # 체크박스를 클릭하는 것처럼 무관한 위젯 조작도 스크립트 전체를
+    # 재실행시키는데, uploaded는 그대로 남아있으므로 이 캐시가 없으면 매번
+    # YOLO 추론을 다시 돌리고 공유 이력에도 중복으로 기록된다.
+    session_tag = st.session_state.setdefault("session_tag", uuid.uuid4().hex[:8])
+    current_analysis_key = f"{turbine_id}:{uploaded.file_id}"
+
+    if st.session_state.get("last_analysis_key") != current_analysis_key:
+        # ===== 순차 진행 상태 표시 =====
+        with st.status("분석 진행 중...", expanded=True) as status:
+            if is_video:
+                st.write("🎞️ 영상 로드 중...")
+                tmp_path = f"_tmp_upload_{session_tag}.{file_ext}"
+                with open(tmp_path, "wb") as f:
+                    f.write(uploaded.getbuffer())
+                time.sleep(0.3)
+
+                st.write(f"🔎 프레임 샘플링(최대 {VIDEO_MAX_FRAMES}개) 및 YOLO 탐지 진행 중...")
+                result = assess_video(
+                    model, tmp_path, turbine_id=turbine_id,
+                    sample_interval_sec=VIDEO_SAMPLE_INTERVAL_SEC, max_frames=VIDEO_MAX_FRAMES,
+                )
+                yolo_res = result["yolo_result"]
+                st.write(
+                    f"🖼️ 대표 프레임 선정 완료 — {result['timestamp_sec']}초 지점 "
+                    f"(총 {result['sampled_frames']}프레임 중 위험도 최고)"
+                )
+                time.sleep(0.3)
+
+                st.write("🎬 탐지 결과 타임랩스 영상 생성 중...")
+                frame_plots_bgr = [
+                    fr["yolo_result"][fr["yolo_result"].boxes.conf >= DISPLAY_CONF_MIN]
+                    .plot(line_width=2, font_size=13)
+                    for fr in result["frame_results"]
+                ]
+                # 세션마다 고유한 파일명 — 동시에 접속한 다른 관리자의 분석과
+                # 같은 임시 파일을 공유하면 서로의 결과가 덮어써질 수 있다.
+                output_video_path = f"_tmp_detection_timelapse_{session_tag}.mp4"
+                try:
+                    encode_frames_to_video(frame_plots_bgr, VIDEO_OUTPUT_FPS, output_video_path)
+                    result["output_video_path"] = output_video_path
+                except Exception as e:
+                    result["video_encode_error"] = str(e)
+                time.sleep(0.3)
+            else:
+                st.write("🖼️ 이미지 로드 중...")
+                img = Image.open(uploaded).convert("RGB")
+                tmp_path = f"_tmp_upload_{session_tag}.jpg"
+                img.save(tmp_path)
+                time.sleep(0.3)
+
+                st.write("🔎 YOLO 탐지 진행 중...")
+                result = assess_image(model, tmp_path, turbine_id=turbine_id)
+                yolo_res = result["yolo_result"]
+                time.sleep(0.3)
+
+            st.write("📐 심각도 계산 중...")
             time.sleep(0.3)
 
-            st.write(f"🔎 프레임 샘플링(최대 {VIDEO_MAX_FRAMES}개) 및 YOLO 탐지 진행 중...")
-            result = assess_video(
-                model, tmp_path, turbine_id=turbine_id,
-                sample_interval_sec=VIDEO_SAMPLE_INTERVAL_SEC, max_frames=VIDEO_MAX_FRAMES,
-            )
-            yolo_res = result["yolo_result"]
-            st.write(
-                f"🖼️ 대표 프레임 선정 완료 — {result['timestamp_sec']}초 지점 "
-                f"(총 {result['sampled_frames']}프레임 중 위험도 최고)"
-            )
+            grade = result["grade"]
+            st.write(f"{result['emoji']} 등급 판정 완료 — {grade}")
             time.sleep(0.3)
 
-            st.write("🎬 탐지 결과 타임랩스 영상 생성 중...")
-            frame_plots_bgr = [
-                fr["yolo_result"][fr["yolo_result"].boxes.conf >= DISPLAY_CONF_MIN]
-                .plot(line_width=2, font_size=13)
-                for fr in result["frame_results"]
-            ]
-            output_video_path = "_tmp_detection_timelapse.mp4"
+            st.write("📢 에스컬레이션 정책 확인 중...")
+            time.sleep(0.3)
+
+            status.update(label="분석 완료", state="complete", expanded=False)
+
+        st.write("")
+
+        # 위험 등급은 담당자 알림 버튼을 누르지 않아도 ntfy 푸시를 자동 발송한다.
+        # (이 블록 자체가 파일당 한 번만 실행되므로 별도 중복 방지 키는 필요 없다.)
+        if grade == "위험":
             try:
-                encode_frames_to_video(frame_plots_bgr, VIDEO_OUTPUT_FPS, output_video_path)
-                result["output_video_path"] = output_video_path
+                send_ntfy_alert(result)
+                st.session_state.ntfy_status = ("success", None, True)
             except Exception as e:
-                result["video_encode_error"] = str(e)
-            time.sleep(0.3)
-        else:
-            st.write("🖼️ 이미지 로드 중...")
-            img = Image.open(uploaded).convert("RGB")
-            tmp_path = "_tmp_upload.jpg"
-            img.save(tmp_path)
-            time.sleep(0.3)
+                st.session_state.ntfy_status = ("error", str(e), True)
 
-            st.write("🔎 YOLO 탐지 진행 중...")
-            result = assess_image(model, tmp_path, turbine_id=turbine_id)
-            yolo_res = result["yolo_result"]
-            time.sleep(0.3)
+        inspected_at = datetime.now()
+        shared_history = load_history()
+        previous = next(
+            (item for item in shared_history if item["터빈"] == turbine_id),
+            {"위험도": 24.0, "Damage": 1, "Dirt": 2, "등급": "🟠 주의"},
+        )
+        is_demo_previous = not any(item["터빈"] == turbine_id for item in shared_history)
 
-        st.write("📐 심각도 계산 중...")
-        time.sleep(0.3)
+        # 화면 및 PDF에 동일한 고신뢰도 탐지 이미지를 사용
+        display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
+        # 표시 전용 라벨 크기와 선 두께를 고정해 박스 가장자리의 가독성을 확보한다.
+        plotted = display_res.plot(line_width=2, font_size=13)[:, :, ::-1]
 
-        grade = result["grade"]
-        st.write(f"{result['emoji']} 등급 판정 완료 — {grade}")
-        time.sleep(0.3)
+        # ===== 공유 점검 이력에 기록 (모든 관리자가 함께 봄) =====
+        add_history_entry({
+            "시각": inspected_at.strftime("%H:%M:%S"),
+            "날짜": inspected_at.strftime("%Y-%m-%d"),
+            "터빈": turbine_id,
+            "등급": f"{result['emoji']} {grade}",
+            "위험도": result["score"],
+            "Damage": result["n_damage"],
+            "Dirt": result["n_dirt"],
+            "grade": result["grade"], "emoji": result["emoji"], "score": result["score"],
+            "n_damage": result["n_damage"], "n_dirt": result["n_dirt"], "recheck": result["recheck"],
+            "channels": result["channels"], "targets": result["targets"],
+            "counted": result["counted"], "recheck_list": result["recheck_list"],
+            "source": result.get("source", "image"),
+            "timestamp_sec": result.get("timestamp_sec"),
+            "sampled_frames": result.get("sampled_frames"),
+            "inspected_at": inspected_at.isoformat(),
+            "previous_snapshot": previous,
+            "is_demo_previous": is_demo_previous,
+            "plotted_image_b64": image_to_base64_jpeg(plotted),
+        })
 
-        st.write("📢 에스컬레이션 정책 확인 중...")
-        time.sleep(0.3)
+        st.session_state.last_analysis_key = current_analysis_key
+        st.session_state.last_analysis = {
+            "result": result, "turbine_id": turbine_id, "plotted": plotted,
+            "inspected_at": inspected_at, "previous": previous, "is_demo_previous": is_demo_previous,
+        }
 
-        status.update(label="분석 완료", state="complete", expanded=False)
-
-    st.write("")
-
-    # 위험 등급은 담당자 알림 버튼을 누르지 않아도 ntfy 푸시를 자동 발송한다.
-    # 같은 업로드+터빈ID 조합에서는 재실행(다른 버튼 클릭 등)마다 중복 발송되지
-    # 않도록 file_id로 한 번만 보낸다.
-    auto_alert_key = f"{turbine_id}:{uploaded.file_id}"
-    if grade == "위험" and st.session_state.get("last_auto_alert_key") != auto_alert_key:
-        try:
-            send_ntfy_alert(result)
-            st.session_state.ntfy_status = ("success", None, True)
-        except Exception as e:
-            st.session_state.ntfy_status = ("error", str(e), True)
-        st.session_state.last_auto_alert_key = auto_alert_key
-
-    inspected_at = datetime.now()
-    shared_history = load_history()
-    previous = next(
-        (item for item in shared_history if item["터빈"] == turbine_id),
-        {"위험도": 24.0, "Damage": 1, "Dirt": 2, "등급": "🟠 주의"},
+    cached = st.session_state.last_analysis
+    render_analysis(
+        cached["result"], cached["turbine_id"], cached["plotted"], cached["inspected_at"],
+        cached["previous"], cached["is_demo_previous"],
     )
-    is_demo_previous = not any(item["터빈"] == turbine_id for item in shared_history)
-
-    # 화면 및 PDF에 동일한 고신뢰도 탐지 이미지를 사용
-    display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
-    # 표시 전용 라벨 크기와 선 두께를 고정해 박스 가장자리의 가독성을 확보한다.
-    plotted = display_res.plot(line_width=2, font_size=13)[:, :, ::-1]
-
-    render_analysis(result, turbine_id, plotted, inspected_at, previous, is_demo_previous)
-
-    # ===== 공유 점검 이력에 기록 (모든 관리자가 함께 봄) =====
-    add_history_entry({
-        "시각": inspected_at.strftime("%H:%M:%S"),
-        "날짜": inspected_at.strftime("%Y-%m-%d"),
-        "터빈": turbine_id,
-        "등급": f"{result['emoji']} {grade}",
-        "위험도": result["score"],
-        "Damage": result["n_damage"],
-        "Dirt": result["n_dirt"],
-        "grade": result["grade"], "emoji": result["emoji"], "score": result["score"],
-        "n_damage": result["n_damage"], "n_dirt": result["n_dirt"], "recheck": result["recheck"],
-        "channels": result["channels"], "targets": result["targets"],
-        "counted": result["counted"], "recheck_list": result["recheck_list"],
-        "source": result.get("source", "image"),
-        "timestamp_sec": result.get("timestamp_sec"),
-        "sampled_frames": result.get("sampled_frames"),
-        "inspected_at": inspected_at.isoformat(),
-        "previous_snapshot": previous,
-        "is_demo_previous": is_demo_previous,
-        "plotted_image_b64": image_to_base64_jpeg(plotted),
-    })
 
 elif st.session_state.get("selected_history_id"):
     shared_history = load_history()
@@ -1191,10 +1167,21 @@ if shared_history:
     )
 
     selected_rows = event.selection.rows if event and event.selection else []
-    if selected_rows and not uploaded:
-        selected_entry = df.iloc[selected_rows[0]]
-        if st.button(f"🔍 선택한 점검 불러오기 ({selected_entry['터빈']} · {selected_entry['시각']})"):
-            st.session_state["selected_history_id"] = selected_entry["id"]
-            st.rerun()
+    if selected_rows:
+        selected_entry = df.iloc[selected_rows[0]].to_dict()
+        load_col, delete_col = st.columns(2)
+        with load_col:
+            if st.button(
+                f"🔍 불러오기 ({selected_entry['터빈']} · {selected_entry['시각']})",
+                width="stretch",
+            ):
+                st.session_state["selected_history_id"] = selected_entry["id"]
+                st.rerun()
+        with delete_col:
+            if st.button(
+                f"🗑️ 테스트 기록 삭제 ({selected_entry['터빈']} · {selected_entry['시각']})",
+                width="stretch",
+            ):
+                confirm_delete_history_entry(selected_entry)
 else:
     st.caption("아직 점검 이력이 없습니다. 이미지나 영상을 업로드하세요.")

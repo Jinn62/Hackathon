@@ -11,7 +11,7 @@ severity.py — 풍력 터빈 손상 심각도 판정 + 에스컬레이션
     print(result["message"])
 """
 
-# ===== 설정 (나중에 테스트 후 조정) =====
+# ===== 판정 설정 =====
 CLASSES = {0: "Dirt", 1: "Damage"}
 CLASS_WEIGHT = {0: 2, 1: 10}      # 손상이 오염보다 5배 위험
 

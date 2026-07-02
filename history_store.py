@@ -30,6 +30,13 @@ def _read_unlocked():
         return []
 
 
+def _write_unlocked(history):
+    tmp_path = HISTORY_PATH.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False)
+    tmp_path.replace(HISTORY_PATH)  # 원자적 교체 — 동시 읽기 중 깨진 파일 방지
+
+
 def load_history():
     """저장된 점검 이력을 최신순(등록 역순)으로 반환한다."""
     with _lock:
@@ -44,11 +51,22 @@ def add_history_entry(entry):
         history = _read_unlocked()
         history.insert(0, entry)
         history = history[:MAX_HISTORY]
-        tmp_path = HISTORY_PATH.with_suffix(".json.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False)
-        tmp_path.replace(HISTORY_PATH)  # 원자적 교체 — 동시 읽기 중 깨진 파일 방지
+        _write_unlocked(history)
     return entry
+
+
+def delete_entries(entry_ids):
+    """주어진 id들에 해당하는 점검 기록을 삭제한다. 실제로 삭제된 개수를 반환한다."""
+    entry_ids = set(entry_ids)
+    if not entry_ids:
+        return 0
+    with _lock:
+        history = _read_unlocked()
+        remaining = [item for item in history if item.get("id") not in entry_ids]
+        deleted = len(history) - len(remaining)
+        if deleted:
+            _write_unlocked(remaining)
+    return deleted
 
 
 def find_entry(history, entry_id):
