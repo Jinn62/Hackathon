@@ -6,3 +6,4 @@ _tmp_detection_timelapse*
 history_store.json*
 .venv/
 venv/
+발표/

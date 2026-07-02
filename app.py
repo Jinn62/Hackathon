@@ -725,6 +725,10 @@ def confirm_delete_history_entry(entry):
             delete_entries([entry["id"]])
             if st.session_state.get("selected_history_id") == entry["id"]:
                 st.session_state.pop("selected_history_id", None)
+            # 삭제로 이력 표가 줄어들면, 표 위젯(key="history_table")이 들고 있던
+            # 선택 인덱스가 더 이상 존재하지 않는 위치를 가리켜 다음 렌더에서
+            # df.iloc[...]가 IndexError를 낸다. 선택 상태를 명시적으로 비운다.
+            st.session_state["history_table"] = {"selection": {"rows": [], "columns": [], "cells": []}}
             st.toast("테스트 기록을 삭제했습니다.")
             st.rerun()
     with col_cancel:
@@ -1167,7 +1171,9 @@ if shared_history:
     )
 
     selected_rows = event.selection.rows if event and event.selection else []
-    if selected_rows:
+    # 다른 관리자가 같은 기록을 먼저 지웠거나, 위젯이 삭제 전 선택 인덱스를
+    # 아직 들고 있는 경우를 대비한 방어적 범위 체크 (df.iloc IndexError 방지).
+    if selected_rows and selected_rows[0] < len(df):
         selected_entry = df.iloc[selected_rows[0]].to_dict()
         load_col, delete_col = st.columns(2)
         with load_col:
